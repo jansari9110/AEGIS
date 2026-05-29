@@ -14,13 +14,15 @@ TAGLINE      = "AI-Powered SOC Analyst Toolkit"
 
 # This banner prints in terminal whenever AEGIS starts
 BANNER = f"""
-  ╔══════════════════════════════════════════════╗
-  ║   {TOOL_NAME} — {FULL_NAME[:35]}  ║
-  ║   {TAGLINE:<44}║
-  ║   {VERSION:<10} Built by {AUTHOR:<33}║
-  ╚══════════════════════════════════════════════╝
-  {RIGHTS}
-  {GITHUB}
+  ╔═════════════════════════════════════════════════╗
+
+      {TOOL_NAME} — {FULL_NAME[:35]}
+      {TAGLINE:<44}
+      {VERSION:<10} Built by {AUTHOR:<33}
+
+  ╚═════════════════════════════════════════════════╝
+
+  {RIGHTS} ║ {GITHUB}
 """
 
 # Short one-line credit for dashboard footer
