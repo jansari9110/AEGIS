@@ -1,0 +1,9 @@
+requests
+python-whois
+dnspython
+google-generativeai
+fastapi
+uvicorn
+sqlalchemy
+pydantic
+elasticsearch

@@ -26,6 +26,7 @@ import sys
 import re
 import os
 from datetime import datetime
+from branding import BANNER, FOOTER
 import whois
 
 # Import API keys from config.py
@@ -398,13 +399,7 @@ def check_ioc(indicator):
 # ── ENTRY POINT ───────────────────────────────────────────────────────────────
 if __name__ == "__main__":
 
-    print(f"""{BOLD}{BLUE}
-  ╔══════════════════════════════════════════╗
-  ║   AEGIS — IOC Checker  v0.1              ║
-  ║   Automated Exploit & Guard              ║
-  ║   Intelligence System                    ║
-  ╚══════════════════════════════════════════╝
-{RESET}""")
+    print(f"{BOLD}{BLUE}{BANNER}{RESET}")
 
     # Command line mode: python3 ioc_checker.py 8.8.8.8
     if len(sys.argv) > 1:
