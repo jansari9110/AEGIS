@@ -1,0 +1,420 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>AEGIS — SOC Analyst Dashboard</title>
+  <link rel="stylesheet" href="style.css">
+  <!-- Tabler Icons — free icon library, loaded from CDN -->
+  <link rel="stylesheet"
+    href="https://cdn.jsdelivr.net/npm/@tabler/icons-webfont@latest/tabler-icons.min.css">
+</head>
+<body>
+
+  <!-- ── TOP BAR ─────────────────────────────────────────────── -->
+  <header class="topbar">
+    <div class="topbar-left">
+      <div class="logo">
+        <div class="logo-shield">
+          <i class="ti ti-shield-lock"></i>
+        </div>
+        <div class="logo-text">
+          <span class="logo-name">AEGIS</span>
+          <span class="logo-sub">SOC Analyst Dashboard</span>
+        </div>
+      </div>
+    </div>
+    <div class="topbar-right">
+      <div class="live-badge">
+        <div class="live-dot"></div>
+        Live
+      </div>
+      <div class="clock" id="clock">--:--:--</div>
+      <div class="author-badge">Built by Jigar</div>
+    </div>
+  </header>
+
+  <!-- ── NAVIGATION ──────────────────────────────────────────── -->
+  <nav class="navbar">
+    <button class="nav-btn active"
+      onclick="showPage('alerts', this)">
+      <i class="ti ti-list"></i> Alert Queue
+    </button>
+    <button class="nav-btn"
+      onclick="showPage('ioc', this)">
+      <i class="ti ti-search"></i> IOC Checker
+    </button>
+    <button class="nav-btn"
+      onclick="showPage('email', this)">
+      <i class="ti ti-mail"></i> Email Analyser
+    </button>
+    <button class="nav-btn"
+      onclick="showPage('heatmap', this)">
+      <i class="ti ti-layout-grid"></i> ATT&CK Heatmap
+    </button>
+    <button class="nav-btn"
+      onclick="showPage('metrics', this)">
+      <i class="ti ti-chart-bar"></i> Metrics
+    </button>
+  </nav>
+
+  <!-- ── MAIN CONTENT ────────────────────────────────────────── -->
+  <main class="main-content">
+
+    <!-- ════════════════════════════════════════════════════════
+         PAGE 1 — ALERT QUEUE
+    ═════════════════════════════════════════════════════════ -->
+    <div id="page-alerts" class="page active">
+
+      <!-- Metrics bar -->
+      <div class="metrics-grid">
+        <div class="metric-card">
+          <div class="metric-val" id="m-total">0</div>
+          <div class="metric-lbl">Total alerts</div>
+          <div class="metric-delta positive"
+               id="m-total-sub">Loading...</div>
+        </div>
+        <div class="metric-card">
+          <div class="metric-val danger"
+               id="m-high">0</div>
+          <div class="metric-lbl">High risk</div>
+          <div class="metric-delta danger">Score ≥ 70</div>
+        </div>
+        <div class="metric-card">
+          <div class="metric-val" id="m-open">0</div>
+          <div class="metric-lbl">Open alerts</div>
+          <div class="metric-delta">Pending review</div>
+        </div>
+        <div class="metric-card">
+          <div class="metric-val positive" id="m-fp">0%</div>
+          <div class="metric-lbl">FP rate</div>
+          <div class="metric-delta positive">
+            Auto-calculated
+          </div>
+        </div>
+      </div>
+
+      <!-- Alert table -->
+      <div class="section-header">
+        <span class="section-title">
+          <i class="ti ti-list"></i>
+          Live alert queue — sorted by risk score
+        </span>
+        <button class="refresh-btn" onclick="loadAlerts()">
+          <i class="ti ti-refresh"></i> Refresh
+        </button>
+      </div>
+
+      <div class="table-wrap">
+        <table class="alert-table">
+          <thead>
+            <tr>
+              <th>Risk</th>
+              <th>Score</th>
+              <th>Type</th>
+              <th>Indicator</th>
+              <th>MITRE</th>
+              <th>Kill chain</th>
+              <th>Status</th>
+              <th>Time</th>
+            </tr>
+          </thead>
+          <tbody id="alert-tbody">
+            <tr>
+              <td colspan="8" class="loading-row">
+                <i class="ti ti-loader spin"></i>
+                Loading alerts...
+              </td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <!-- Alert detail panel (hidden until row clicked) -->
+      <div class="detail-panel" id="detail-panel">
+        <div class="detail-header">
+          <div>
+            <div class="detail-title" id="d-title">—</div>
+            <div class="detail-sub" id="d-sub">—</div>
+          </div>
+          <button class="close-btn"
+            onclick="closeDetail()"
+            aria-label="Close">
+            <i class="ti ti-x"></i>
+          </button>
+        </div>
+
+        <!-- Enrichment data grid -->
+        <div class="detail-grid">
+          <div class="detail-field">
+            <div class="field-label">Indicator</div>
+            <div class="field-val mono" id="d-indicator">—</div>
+          </div>
+          <div class="detail-field">
+            <div class="field-label">Risk score</div>
+            <div class="field-val" id="d-score">—</div>
+          </div>
+          <div class="detail-field">
+            <div class="field-label">VirusTotal</div>
+            <div class="field-val mono" id="d-vt">—</div>
+          </div>
+          <div class="detail-field">
+            <div class="field-label">AbuseIPDB</div>
+            <div class="field-val" id="d-abuse">—</div>
+          </div>
+          <div class="detail-field">
+            <div class="field-label">MITRE technique</div>
+            <div class="field-val mono" id="d-mitre">—</div>
+          </div>
+          <div class="detail-field">
+            <div class="field-label">Kill chain stage</div>
+            <div class="field-val" id="d-killchain">—</div>
+          </div>
+          <div class="detail-field">
+            <div class="field-label">CVE</div>
+            <div class="field-val mono" id="d-cve">—</div>
+          </div>
+          <div class="detail-field">
+            <div class="field-label">Source</div>
+            <div class="field-val" id="d-source">—</div>
+          </div>
+        </div>
+
+        <!-- Risk score bar -->
+        <div class="score-bar-wrap">
+          <div class="score-bar-labels">
+            <span>Risk level</span>
+            <span id="d-score-pct">0/100</span>
+          </div>
+          <div class="score-bar-bg">
+            <div class="score-bar-fill"
+                 id="d-score-bar"
+                 style="width:0%">
+            </div>
+          </div>
+        </div>
+
+        <!-- AI Investigation Report -->
+        <div class="ai-report-box">
+          <div class="ai-report-label">
+            <i class="ti ti-sparkles"></i>
+            AI Investigation Report
+            <span class="ai-badge">Gemini</span>
+          </div>
+          <div class="ai-report-text" id="d-ai-report">
+            Click "Generate AI Report" to analyse this alert
+          </div>
+          <button class="ai-btn"
+            id="ai-btn"
+            onclick="generateAIReport()">
+            <i class="ti ti-sparkles"></i>
+            Generate AI Report
+          </button>
+        </div>
+
+        <!-- Analyst notes -->
+        <div class="notes-section">
+          <div class="field-label">Investigation notes</div>
+          <textarea
+            id="analyst-notes"
+            class="notes-input"
+            placeholder="Write your investigation findings here..."
+            rows="3">
+          </textarea>
+          <div class="action-row">
+            <button class="act-btn btn-danger"
+              onclick="updateStatus('escalated')">
+              <i class="ti ti-arrow-up"></i> Escalate to L2
+            </button>
+            <button class="act-btn btn-success"
+              onclick="submitFeedback(true)">
+              <i class="ti ti-thumb-up"></i> True Positive
+            </button>
+            <button class="act-btn btn-gray"
+              onclick="submitFeedback(false)">
+              <i class="ti ti-thumb-down"></i> False Positive
+            </button>
+            <button class="act-btn btn-primary"
+              onclick="saveNote()">
+              <i class="ti ti-device-floppy"></i> Save note
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ════════════════════════════════════════════════════════
+         PAGE 2 — IOC CHECKER
+    ═════════════════════════════════════════════════════════ -->
+    <div id="page-ioc" class="page">
+      <div class="page-header">
+        <h2>IOC Checker</h2>
+        <p>Check any IP address, domain, URL, or file hash
+           against VirusTotal, AbuseIPDB, and WHOIS</p>
+      </div>
+
+      <div class="checker-card">
+        <div class="input-row">
+          <input
+            type="text"
+            id="ioc-input"
+            class="checker-input"
+            placeholder="Enter IP, domain, URL, or file hash..."
+            onkeypress="if(event.key==='Enter') submitIOC()">
+          <button class="submit-btn" onclick="submitIOC()">
+            <i class="ti ti-search"></i> Analyse
+          </button>
+        </div>
+        <div class="input-hint">
+          Examples: 185.220.101.47 · google.com ·
+          https://suspicious-site.com ·
+          44d88612fea8a8f36de82e1278abb02f
+        </div>
+      </div>
+
+      <div id="ioc-result" class="result-area hidden"></div>
+    </div>
+
+    <!-- ════════════════════════════════════════════════════════
+         PAGE 3 — EMAIL ANALYSER
+    ═════════════════════════════════════════════════════════ -->
+    <div id="page-email" class="page">
+      <div class="page-header">
+        <h2>Email Phishing Analyser</h2>
+        <p>Paste raw email headers to check for
+           phishing indicators</p>
+      </div>
+
+      <div class="checker-card">
+        <textarea
+          id="email-input"
+          class="email-textarea"
+          placeholder="Paste raw email headers here...
+Example:
+From: support@paypa1-verify.com
+Reply-To: attacker@evil.ru
+Received: from mail.evil.ru (185.220.101.47)..."
+          rows="8">
+        </textarea>
+        <div class="input-row" style="margin-top:10px;">
+          <button class="submit-btn" onclick="submitEmail()">
+            <i class="ti ti-mail-search"></i>
+            Analyse Email
+          </button>
+          <button class="submit-btn btn-secondary"
+            onclick="loadTestEmail()">
+            <i class="ti ti-test-pipe"></i>
+            Load test phishing email
+          </button>
+        </div>
+      </div>
+
+      <div id="email-result" class="result-area hidden"></div>
+    </div>
+
+    <!-- ════════════════════════════════════════════════════════
+         PAGE 4 — ATT&CK HEATMAP
+    ═════════════════════════════════════════════════════════ -->
+    <div id="page-heatmap" class="page">
+      <div class="page-header">
+        <h2>MITRE ATT&CK Heatmap</h2>
+        <p>Active techniques detected today —
+           colour intensity = alert count</p>
+      </div>
+
+      <div class="heatmap-legend">
+        <span class="legend-item">
+          <span class="legend-dot danger"></span>
+          High activity
+        </span>
+        <span class="legend-item">
+          <span class="legend-dot warning"></span>
+          Medium activity
+        </span>
+        <span class="legend-item">
+          <span class="legend-dot positive"></span>
+          Low activity
+        </span>
+        <span class="legend-item">
+          <span class="legend-dot inactive"></span>
+          No activity
+        </span>
+      </div>
+
+      <div class="heatmap-grid" id="heatmap-grid">
+        <div class="loading-row">
+          <i class="ti ti-loader spin"></i>
+          Loading heatmap...
+        </div>
+      </div>
+    </div>
+
+    <!-- ════════════════════════════════════════════════════════
+         PAGE 5 — METRICS
+    ═════════════════════════════════════════════════════════ -->
+    <div id="page-metrics" class="page">
+      <div class="page-header">
+        <h2>SOC Metrics</h2>
+        <p>Performance comparison — AEGIS vs manual analysis</p>
+      </div>
+
+      <div class="metrics-compare">
+        <div class="compare-card">
+          <div class="compare-title danger">
+            Without AEGIS
+          </div>
+          <div class="compare-item">
+            MTTA: <strong>56 minutes</strong>
+          </div>
+          <div class="compare-item">
+            Investigation: <strong>70 min/alert</strong>
+          </div>
+          <div class="compare-item">
+            Coverage: <strong>37% of alerts</strong>
+          </div>
+          <div class="compare-item">
+            FP handled: <strong>manually</strong>
+          </div>
+        </div>
+        <div class="compare-divider">VS</div>
+        <div class="compare-card">
+          <div class="compare-title positive">
+            With AEGIS
+          </div>
+          <div class="compare-item">
+            MTTA: <strong>~3 seconds</strong>
+          </div>
+          <div class="compare-item">
+            Investigation:
+            <strong>AI pre-filled</strong>
+          </div>
+          <div class="compare-item">
+            Coverage: <strong>100% processed</strong>
+          </div>
+          <div class="compare-item">
+            FP rate:
+            <strong id="fp-compare">calculating...</strong>
+          </div>
+        </div>
+      </div>
+
+      <div class="stats-detail" id="stats-detail">
+        <div class="loading-row">
+          <i class="ti ti-loader spin"></i>
+          Loading statistics...
+        </div>
+      </div>
+    </div>
+
+  </main>
+
+  <!-- ── FOOTER ──────────────────────────────────────────────── -->
+  <footer class="footer">
+    AEGIS v1.0 — Built by Jigar |
+    AI-Powered SOC Analyst Toolkit |
+    <span id="footer-count">0</span> alerts processed
+  </footer>
+
+  <script src="app.js"></script>
+</body>
+</html>
