@@ -1,108 +1,113 @@
 """
-AEGIS — FastAPI Backend (main.py)
-==================================
-What this file does:
-  The central nervous system of AEGIS.
-  Every other module plugs into this file.
+AEGIS — Reconstructed FastAPI Backend
+======================================
+Complete rewrite following Sentinel pattern.
 
-  It creates a web server with these endpoints:
+Endpoints:
+  AUTH
+    POST /auth/login          — get JWT token
+    GET  /auth/me             — get current analyst
 
-  POST /alert              — receive a new alert (from Shuffle/Wazuh)
-  POST /alert/manual       — analyst submits IOC manually
-  GET  /alerts             — get all alerts (dashboard)
-  GET  /alert/{id}         — get one alert with full details
-  PUT  /alert/{id}/status  — update alert status
-  POST /alert/{id}/notes   — add analyst note
-  POST /alert/{id}/feedback — thumbs up/down
-  GET  /stats              — dashboard metrics
-  GET  /health             — is AEGIS running?
-  POST /wazuh-alert        — webhook for Wazuh via Shuffle
-  GET  /mitre/heatmap      — ATT&CK heatmap data
+  INCIDENTS (Wazuh/attack engine only)
+    GET  /incidents           — get incidents by status
+    GET  /incident/{id}       — get one incident + timeline
+    POST /incident/{id}/assign       — analyst takes ownership
+    POST /incident/{id}/investigate  — mark as investigating
+    POST /incident/{id}/note         — add investigation note
+    POST /incident/{id}/close        — close as TP or FP
+    POST /incident/{id}/escalate     — escalate to L2
+    POST /incident/{id}/ai-report    — generate Gemini 6W report
 
-New Python concepts in this file:
-  @app.get / @app.post     — route decorators
-  async def                — async function (non-blocking)
-  Depends()                — dependency injection
-  HTTPException            — raise HTTP errors cleanly
-  BaseModel (Pydantic)     — data validation models
-  Optional[]               — type hint for optional fields
-  BackgroundTasks          — run tasks after response sent
-  JSONResponse             — return custom JSON response
-  status codes             — HTTP 200, 201, 404, 422, 500
+  WEBHOOKS (automated sources)
+    POST /webhook/wazuh       — receive Wazuh alerts via Shuffle
+
+  ANALYST TOOLKIT (separate from incidents)
+    POST /toolkit/ioc         — check IP/domain/URL/hash
+    POST /toolkit/email       — analyse phishing email headers
+
+  STATS + INTELLIGENCE
+    GET  /stats               — dashboard metrics
+    GET  /mitre/heatmap       — ATT&CK technique counts
+    GET  /analysts/active     — who is online
+
+  HEALTH
+    GET  /health              — server status
 """
 
-import sys
-import os
-import json
-from datetime import datetime
-from typing import Optional, List
-import traceback
+import sys, os, json
+from datetime import datetime, timedelta
+from typing import Optional
+from contextlib import asynccontextmanager
 
-# FastAPI imports
 from fastapi import (
     FastAPI, Depends, HTTPException,
     BackgroundTasks, status
 )
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
-
-# Pydantic for data validation
+from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from pydantic import BaseModel
-
-# SQLAlchemy session
 from sqlalchemy.orm import Session
 
-# Add backend directory to path
+# JWT
+import jwt as pyjwt
+
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
-# AEGIS modules
 from database import (
-    init_db, get_db, save_alert,
-    get_all_alerts, get_alert_by_id, get_stats,
-    Alert, AnalystNote, SessionLocal
+    init_db, get_db, SessionLocal,
+    Analyst, Incident, InvestigationNote, IOCScan,
+    save_incident, get_incidents, get_incident_by_id,
+    add_investigation_note, get_incident_timeline,
+    get_analyst_by_username, get_analyst_by_id,
+    create_analyst, verify_password, get_stats
 )
 from ioc_checker import check_ioc
-from risk_scorer import calculate_score, score_from_ioc_result
-from mitre_tagger import tag_alert, MitreTag
+from risk_scorer import score_from_ioc_result
+from mitre_tagger import tag_alert
 from cve_lookup import enrich_alert_with_cves
-from branding import TOOL_NAME, VERSION, AUTHOR, FOOTER
+from branding import TOOL_NAME, VERSION, AUTHOR
 
-# ── COLOURS FOR TERMINAL ──────────────────────────────────────────────────────
+# ── COLOURS ───────────────────────────────────────────────────────
 GREEN  = "\033[92m"
 BLUE   = "\033[94m"
 YELLOW = "\033[93m"
 BOLD   = "\033[1m"
 RESET  = "\033[0m"
 
+# ── JWT CONFIG ────────────────────────────────────────────────────
+JWT_SECRET    = "aegis-secret-key-change-in-production"
+JWT_ALGORITHM = "HS256"
+JWT_EXPIRE_HOURS = 8
 
-# ══════════════════════════════════════════════════════════════════════════════
-# FASTAPI APP SETUP
-# ══════════════════════════════════════════════════════════════════════════════
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/login")
 
-"""
-NEW CONCEPT — FastAPI():
-  Creates the web application instance.
-  title, description, version appear in the auto-generated
-  API documentation at localhost:8000/docs
-"""
+
+# ══════════════════════════════════════════════════════════════════
+# APP SETUP
+# ══════════════════════════════════════════════════════════════════
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    print(f"\n{BOLD}{BLUE}")
+    print("  ╔══════════════════════════════════════════╗")
+    print(f"  ║   AEGIS {VERSION} — SOC Analyst Toolkit      ║")
+    print(f"  ║   Built by {AUTHOR:<33}║")
+    print("  ╚══════════════════════════════════════════╝")
+    print(f"{RESET}")
+    init_db()
+    print(f"  {GREEN}[✓] AEGIS backend ready{RESET}")
+    print(f"  {GREEN}[✓] Dashboard: http://localhost:8000/dashboard{RESET}")
+    print(f"  {GREEN}[✓] API docs:   http://localhost:8000/docs{RESET}\n")
+    yield
+
 app = FastAPI(
     title       = f"AEGIS — {TOOL_NAME}",
-    description = f"AI-Powered SOC Analyst Toolkit by {AUTHOR}",
+    description = f"AI-Powered SOC Toolkit by {AUTHOR}",
     version     = VERSION,
-    docs_url    = "/docs",
-    # Auto-generated interactive API docs — very useful for testing
+    lifespan    = lifespan,
 )
 
-"""
-NEW CONCEPT — CORS Middleware:
-  CORS (Cross-Origin Resource Sharing) controls which
-  websites can call your API.
-  Without this, your HTML dashboard (localhost:5500)
-  cannot call your FastAPI (localhost:8000) — browser blocks it.
-  allow_origins=["*"] means any origin can call the API.
-  Fine for local development — restrict in production.
-"""
 app.add_middleware(
     CORSMiddleware,
     allow_origins     = ["*"],
@@ -112,234 +117,540 @@ app.add_middleware(
 )
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# PYDANTIC MODELS — data validation for incoming requests
-# ══════════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════
+# PYDANTIC MODELS
+# ══════════════════════════════════════════════════════════════════
 
-"""
-NEW CONCEPT — Pydantic BaseModel:
-  Defines the exact shape of data that must arrive
-  in a POST request body.
+class NoteIn(BaseModel):
+    note: str
+    action: Optional[str] = "note_added"
 
-  FastAPI uses this to:
-  1. Automatically validate incoming JSON
-  2. Return a clear error if data is wrong format
-  3. Give you typed Python objects instead of raw dicts
+class CloseIn(BaseModel):
+    is_true_positive: bool
+    closing_note: str
 
-  Optional[str] = None means the field is not required.
-  If not provided, it defaults to None.
-"""
+class EscalateIn(BaseModel):
+    escalate_to: str
+    note: str
 
-class AlertCreate(BaseModel):
-    """Schema for creating a new alert manually."""
-    alert_type:     str
-    indicator:      str
+class IOCRequest(BaseModel):
+    indicator: str
     indicator_type: Optional[str] = None
-    # If None, ioc_checker will auto-detect the type
-    source:         Optional[str] = "manual"
-    description:    Optional[str] = None
-    mitre_id:       Optional[str] = None
-    # If provided, skips auto-tagging
+    incident_id: Optional[int] = None
+    # If linked to an incident — shows in timeline
 
+class EmailRequest(BaseModel):
+    raw_headers: str
+    incident_id: Optional[int] = None
 
 class WazuhAlert(BaseModel):
-    """
-    Schema for alerts arriving from Wazuh via Shuffle webhook.
-    Wazuh sends alerts in this format.
-    All fields are Optional because Wazuh alert format varies.
-    """
     rule_id:          Optional[str]  = None
     rule_description: Optional[str]  = None
     rule_level:       Optional[int]  = None
-    # Wazuh severity level 1-15
     agent_name:       Optional[str]  = None
-    # Which machine generated the alert
     agent_ip:         Optional[str]  = None
     src_ip:           Optional[str]  = None
     dst_ip:           Optional[str]  = None
     timestamp:        Optional[str]  = None
-    full_log:         Optional[str]  = None
     mitre_id:         Optional[str]  = None
-    mitre_tactic:     Optional[str]  = None
-    location:         Optional[str]  = None
+    full_log:         Optional[str]  = None
     data:             Optional[dict] = None
-    # Raw Wazuh data field — contains additional context
+
+class SignupIn(BaseModel):
+    username:     str
+    display_name: str
+    password:     str
+    email:        Optional[str] = None
+    role:         Optional[str] = "analyst"
 
 
-class AlertStatusUpdate(BaseModel):
-    """Schema for updating alert status."""
-    status: str
-    # Must be one of: open, investigating, escalated,
-    #                 closed_tp, closed_fp
+# ══════════════════════════════════════════════════════════════════
+# JWT HELPERS
+# ══════════════════════════════════════════════════════════════════
+
+def create_token(analyst_id: int, username: str) -> str:
+    """Creates a JWT token for an analyst."""
+    payload = {
+        "sub":      str(analyst_id),
+        "username": username,
+        "exp":      datetime.utcnow() +
+                    timedelta(hours=JWT_EXPIRE_HOURS),
+    }
+    return pyjwt.encode(payload, JWT_SECRET,
+                        algorithm=JWT_ALGORITHM)
 
 
-class NoteCreate(BaseModel):
-    """Schema for adding analyst investigation notes."""
-    note:   str
-    action: Optional[str] = None
-
-
-class FeedbackCreate(BaseModel):
-    """Schema for analyst true positive / false positive feedback."""
-    is_true_positive: bool
-    # True = real threat, False = false positive
-    notes: Optional[str] = None
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# STARTUP AND SHUTDOWN EVENTS
-# ══════════════════════════════════════════════════════════════════════════════
-
-"""
-NEW CONCEPT — @app.on_event():
-  Runs a function when the server starts or stops.
-  We use startup to:
-    - initialise the database
-    - print the AEGIS banner
-"""
-
-from contextlib import asynccontextmanager
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    # Startup
-    print(f"\n{BOLD}{BLUE}")
-    print("  ╔══════════════════════════════════════════╗")
-    print(f"  ║   AEGIS {VERSION} — SOC Analyst Toolkit      ║")
-    print(f"  ║   Built by {AUTHOR:<33}║")
-    print("  ╚══════════════════════════════════════════╝")
-    print(f"{RESET}")
-    print(f"  {GREEN}[✓] Starting AEGIS backend...{RESET}")
-    init_db()
-    print(f"  {GREEN}[✓] Database ready{RESET}")
-    print(f"  {GREEN}[✓] API docs: http://localhost:8000/docs{RESET}")
-    print(f"  {GREEN}[✓] Dashboard: http://localhost:8000/dashboard{RESET}\n")
-    yield
-    # Shutdown (nothing needed)
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# CORE PROCESSING FUNCTION
-# ══════════════════════════════════════════════════════════════════════════════
-
-def process_alert_pipeline(
-    indicator:      str,
-    alert_type:     str,
-    indicator_type: Optional[str] = None,
-    source:         str = "manual",
-    description:    str = "",
-    mitre_id:       Optional[str] = None,
-    db:             Session = None
-) -> dict:
+def get_current_analyst(
+    token: str = Depends(oauth2_scheme),
+    db: Session = Depends(get_db)
+) -> Analyst:
     """
-    The main AEGIS processing pipeline.
-    Every alert — whether from Wazuh, manual entry,
-    or attack engine — goes through this function.
-
-    Pipeline steps:
-      1. IOC check    — VirusTotal + AbuseIPDB + WHOIS
-      2. Risk score   — 0-100 from all sources
-      3. MITRE tag    — technique ID + kill chain
-      4. CVE lookup   — related vulnerabilities
-      5. Save to DB   — persist everything
-      6. Return dict  — sent back to caller
-
-    This is called a 'pipeline' because data flows
-    through each step in order, each step enriching it.
+    Dependency — validates JWT token and returns analyst.
+    Used by every protected endpoint.
     """
+    try:
+        payload  = pyjwt.decode(token, JWT_SECRET,
+                                algorithms=[JWT_ALGORITHM])
+        analyst_id = int(payload.get("sub"))
+        analyst  = get_analyst_by_id(db, analyst_id)
+        if not analyst or not analyst.is_active:
+            raise HTTPException(status_code=401,
+                               detail="Invalid credentials")
+        return analyst
+    except pyjwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401,
+                           detail="Token expired — please login again")
+    except Exception:
+        raise HTTPException(status_code=401,
+                           detail="Could not validate token")
 
-    print(f"\n{BLUE}[*] Processing alert: "
-          f"{indicator} ({alert_type}){RESET}")
 
-    result = {
-        "indicator":    indicator,
-        "alert_type":   alert_type,
-        "source":       source,
-        "processed_at": datetime.utcnow().isoformat(),
+# ══════════════════════════════════════════════════════════════════
+# AUTH ENDPOINTS
+# ══════════════════════════════════════════════════════════════════
+
+@app.post("/auth/login")
+async def login(
+    form: OAuth2PasswordRequestForm = Depends(),
+    db: Session = Depends(get_db)
+):
+    """
+    Analyst login. Returns JWT token.
+    Use username: admin  password: aegis2025 for first login.
+    """
+    analyst = get_analyst_by_username(db, form.username)
+
+    if not analyst or not verify_password(
+            form.password, analyst.password_hash):
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid username or password"
+        )
+
+    # Update last login time
+    analyst.last_login = datetime.utcnow()
+    db.commit()
+
+    token = create_token(analyst.id, analyst.username)
+
+    return {
+        "access_token": token,
+        "token_type":   "bearer",
+        "analyst": {
+            "id":           analyst.id,
+            "username":     analyst.username,
+            "display_name": analyst.display_name,
+            "role":         analyst.role,
+        }
     }
 
-    # ── Step 1: IOC Check ─────────────────────────────────────────────────────
-    try:
-        ioc_result     = check_ioc(indicator)
-        result["ioc"]  = ioc_result
-        print(f"  {GREEN}[✓] IOC check complete — "
-              f"VT: {ioc_result.get('vt_result',{}).get('malicious',0)}"
-              f"/{ioc_result.get('vt_result',{}).get('total',0)} "
-              f"detections{RESET}")
-    except Exception as e:
-        print(f"  {YELLOW}[!] IOC check failed: {e}{RESET}")
-        ioc_result = {}
-        result["ioc"] = {}
 
-    # ── Step 2: Risk Score ────────────────────────────────────────
-    try:
-        from risk_scorer import score_from_ioc_result
-        score_result = score_from_ioc_result(ioc_result)
-        result["score"] = score_result.to_dict()
-        print(f"  {GREEN}[✓] Risk score: "
-              f"{score_result.score}/100 "
-              f"— {score_result.verdict}{RESET}")
-    except Exception as e:
-        print(f"  {YELLOW}[!] Risk scoring failed: {e}{RESET}")
-        score_result = type('obj', (object,), {
-            'score': 0, 'verdict': 'UNKNOWN',
-            'risk_level': 'LOW', 'colour': 'green',
-            'flags': [], 'to_dict': lambda self: {}
-        })()
+@app.get("/auth/me")
+async def get_me(
+    analyst: Analyst = Depends(get_current_analyst)
+):
+    """Returns current analyst details."""
+    return analyst.to_dict()
 
-    # ── Step 3: MITRE ATT&CK Tag ──────────────────────────────────────────────
-    try:
-        mitre_tag = tag_alert(
-            alert_type  = alert_type,
-            mitre_id    = mitre_id,
-            description = description
+
+@app.post("/auth/signup", status_code=201)
+async def signup(
+    data: SignupIn,
+    db: Session = Depends(get_db)
+):
+    """Creates a new analyst account."""
+    existing = get_analyst_by_username(db, data.username)
+    if existing:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Username '{data.username}' already exists"
         )
-        result["mitre"] = mitre_tag.to_dict()
-        print(f"  {GREEN}[✓] MITRE tag: "
-              f"{mitre_tag.technique_id} "
-              f"({mitre_tag.technique_name}){RESET}")
-    except Exception as e:
-        print(f"  {YELLOW}[!] MITRE tagging failed: {e}{RESET}")
-        mitre_tag = MitreTag()
+    analyst = create_analyst(
+        db,
+        username     = data.username,
+        display_name = data.display_name,
+        password     = data.password,
+        email        = data.email,
+        role         = data.role or "analyst",
+    )
+    return {
+        "message":  "Analyst account created",
+        "analyst":  analyst.to_dict()
+    }
 
-    # ── Step 4: CVE Lookup ────────────────────────────────────────────────────
+
+# ══════════════════════════════════════════════════════════════════
+# INCIDENT ENDPOINTS
+# ══════════════════════════════════════════════════════════════════
+
+@app.get("/incidents")
+async def get_all_incidents(
+    status_filter: Optional[str] = None,
+    limit:  int = 100,
+    offset: int = 0,
+    analyst: Analyst = Depends(get_current_analyst),
+    db: Session = Depends(get_db)
+):
+    """
+    Returns incidents filtered by status.
+    status_filter options:
+      new, assigned, investigating, escalated,
+      closed_tp, closed_fp, open (= new+assigned+investigating)
+    """
+    if status_filter == "open":
+        status_list = ["new", "assigned", "investigating"]
+    elif status_filter:
+        status_list = [status_filter]
+    else:
+        status_list = None
+
+    incidents = get_incidents(db, status_list, limit, offset)
+    return {
+        "incidents": [i.to_dict() for i in incidents],
+        "count":     len(incidents),
+        "total":     db.query(Incident).count(),
+    }
+
+
+@app.get("/incident/{incident_id}")
+async def get_incident(
+    incident_id: int,
+    analyst: Analyst = Depends(get_current_analyst),
+    db: Session = Depends(get_db)
+):
+    """Returns one incident with full timeline."""
+    inc = get_incident_by_id(db, incident_id)
+    if not inc:
+        raise HTTPException(status_code=404,
+                           detail=f"Incident {incident_id} not found")
+
+    result = inc.to_dict()
+
+    # Add raw enrichment data
+    if inc.raw_data:
+        try:
+            result["enrichment"] = json.loads(inc.raw_data)
+        except Exception:
+            result["enrichment"] = {}
+
+    # Add full timeline
+    timeline = get_incident_timeline(db, incident_id)
+    result["timeline"] = [t.to_dict() for t in timeline]
+
+    return result
+
+
+@app.post("/incident/{incident_id}/assign")
+async def assign_incident(
+    incident_id: int,
+    analyst: Analyst = Depends(get_current_analyst),
+    db: Session = Depends(get_db)
+):
+    """Analyst takes ownership of an incident."""
+    inc = get_incident_by_id(db, incident_id)
+    if not inc:
+        raise HTTPException(status_code=404,
+                           detail="Incident not found")
+
+    if inc.assigned_to and inc.assigned_to != analyst.id:
+        assigned = get_analyst_by_id(db, inc.assigned_to)
+        name = assigned.display_name if assigned else "another analyst"
+        raise HTTPException(
+            status_code=409,
+            detail=f"Already assigned to {name}"
+        )
+
+    inc.assigned_to = analyst.id
+    inc.assigned_at = datetime.utcnow()
+    inc.status      = "assigned"
+
+    # Update analyst stats
+    analyst.alerts_investigated += 1
+
+    # Add timeline entry
+    add_investigation_note(
+        db, incident_id, analyst.id, analyst.display_name,
+        "assigned",
+        f"Incident assigned to {analyst.display_name}"
+    )
+
+    db.commit()
+    return {
+        "message":   "Incident assigned",
+        "analyst":   analyst.display_name,
+        "status":    inc.status,
+    }
+
+
+@app.post("/incident/{incident_id}/investigate")
+async def start_investigation(
+    incident_id: int,
+    analyst: Analyst = Depends(get_current_analyst),
+    db: Session = Depends(get_db)
+):
+    """Marks incident as actively being investigated."""
+    inc = get_incident_by_id(db, incident_id)
+    if not inc:
+        raise HTTPException(status_code=404,
+                           detail="Incident not found")
+
+    inc.status = "investigating"
+    add_investigation_note(
+        db, incident_id, analyst.id, analyst.display_name,
+        "status_changed",
+        f"Investigation started by {analyst.display_name}"
+    )
+    db.commit()
+    return {"message": "Investigation started", "status": inc.status}
+
+
+@app.post("/incident/{incident_id}/note")
+async def add_note(
+    incident_id: int,
+    note_in: NoteIn,
+    analyst: Analyst = Depends(get_current_analyst),
+    db: Session = Depends(get_db)
+):
+    """Adds investigation note to incident timeline."""
+    inc = get_incident_by_id(db, incident_id)
+    if not inc:
+        raise HTTPException(status_code=404,
+                           detail="Incident not found")
+
+    add_investigation_note(
+        db, incident_id, analyst.id, analyst.display_name,
+        note_in.action or "note_added",
+        note_in.note
+    )
+    db.commit()
+    return {"message": "Note added", "incident_id": incident_id}
+
+
+@app.post("/incident/{incident_id}/close")
+async def close_incident(
+    incident_id: int,
+    close_in: CloseIn,
+    analyst: Analyst = Depends(get_current_analyst),
+    db: Session = Depends(get_db)
+):
+    """
+    Closes an incident as True Positive or False Positive.
+    Records analyst name, time, verdict, and closing note.
+    """
+    inc = get_incident_by_id(db, incident_id)
+    if not inc:
+        raise HTTPException(status_code=404,
+                           detail="Incident not found")
+
+    inc.status           = ("closed_tp"
+                            if close_in.is_true_positive
+                            else "closed_fp")
+    inc.is_true_positive = close_in.is_true_positive
+    inc.closing_note     = close_in.closing_note
+    inc.closed_at        = datetime.utcnow()
+    inc.closed_by        = analyst.id
+
+    # Calculate investigation time in minutes
+    if inc.assigned_at:
+        delta = datetime.utcnow() - inc.assigned_at
+        inc.investigation_time_mins = int(delta.total_seconds() / 60)
+
+    # Update analyst stats
+    if close_in.is_true_positive:
+        analyst.true_positives  += 1
+    else:
+        analyst.false_positives += 1
+
+    verdict = "TRUE POSITIVE" if close_in.is_true_positive else "FALSE POSITIVE"
+
+    add_investigation_note(
+        db, incident_id, analyst.id, analyst.display_name,
+        inc.status,
+        f"Closed as {verdict} by {analyst.display_name}. "
+        f"Note: {close_in.closing_note}"
+    )
+    db.commit()
+
+    return {
+        "message":          "Incident closed",
+        "incident_id":      incident_id,
+        "verdict":          verdict,
+        "closed_by":        analyst.display_name,
+        "closed_at":        inc.closed_at.isoformat(),
+        "investigation_time": inc.investigation_time_mins,
+    }
+
+
+@app.post("/incident/{incident_id}/escalate")
+async def escalate_incident(
+    incident_id: int,
+    esc_in: EscalateIn,
+    analyst: Analyst = Depends(get_current_analyst),
+    db: Session = Depends(get_db)
+):
+    """Escalates incident to L2 with note."""
+    inc = get_incident_by_id(db, incident_id)
+    if not inc:
+        raise HTTPException(status_code=404,
+                           detail="Incident not found")
+
+    inc.status       = "escalated"
+    inc.escalated_to = esc_in.escalate_to
+
+    add_investigation_note(
+        db, incident_id, analyst.id, analyst.display_name,
+        "escalated",
+        f"Escalated to {esc_in.escalate_to} by "
+        f"{analyst.display_name}. Note: {esc_in.note}"
+    )
+    db.commit()
+
+    return {
+        "message":      "Incident escalated",
+        "escalated_to": esc_in.escalate_to,
+        "by":           analyst.display_name,
+    }
+
+
+@app.post("/incident/{incident_id}/ai-report")
+async def generate_ai_report(
+    incident_id: int,
+    analyst: Analyst = Depends(get_current_analyst),
+    db: Session = Depends(get_db)
+):
+    """Generates Gemini 6W investigation report."""
+    from llm_reporter import generate_investigation_report
+
+    inc = get_incident_by_id(db, incident_id)
+    if not inc:
+        raise HTTPException(status_code=404,
+                           detail="Incident not found")
+
+    result = generate_investigation_report(inc.to_dict())
+
+    if result.get("report"):
+        inc.ai_report = result["report"]
+        add_investigation_note(
+            db, incident_id, analyst.id, analyst.display_name,
+            "ai_report_generated",
+            "AI investigation report generated by Gemini"
+        )
+        db.commit()
+
+    return {
+        "incident_id": incident_id,
+        "report":      result.get("report", ""),
+        "who":         result.get("who", ""),
+        "what":        result.get("what", ""),
+        "where":       result.get("where", ""),
+        "when":        result.get("when", ""),
+        "why":         result.get("why", ""),
+        "how":         result.get("how", ""),
+        "model":       result.get("model", ""),
+        "error":       result.get("error"),
+    }
+
+
+# ══════════════════════════════════════════════════════════════════
+# WEBHOOK — WAZUH ALERTS VIA SHUFFLE
+# ══════════════════════════════════════════════════════════════════
+
+@app.post("/webhook/wazuh", status_code=200)
+async def wazuh_webhook(
+    alert: WazuhAlert,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db)
+):
+    """
+    Receives Wazuh alerts from Shuffle.
+    Creates an incident automatically.
+    No auth required — webhook endpoint.
+    """
+    indicator = (alert.src_ip or
+                 alert.agent_ip or
+                 "unknown")
+
+    # Determine alert type from rule description
+    alert_type = _classify_wazuh_alert(
+        alert.rule_description or "")
+
+    # Build incident title
+    title = (alert.rule_description or
+             f"{alert_type} detected")
+    if indicator != "unknown":
+        title = f"{title[:60]} — {indicator}"
+
+    # Map Wazuh severity (1-15) to our levels
+    level     = alert.rule_level or 5
+    severity  = ("critical" if level >= 12 else
+                 "high"     if level >= 9  else
+                 "medium"   if level >= 6  else
+                 "low")
+
+    # Process in background so Shuffle gets instant response
+    background_tasks.add_task(
+        _process_wazuh_incident,
+        indicator  = indicator,
+        alert_type = alert_type,
+        title      = title,
+        severity   = severity,
+        mitre_id   = alert.mitre_id,
+        description= alert.rule_description or "",
+        rule_id    = alert.rule_id,
+    )
+
+    return {
+        "status":     "received",
+        "indicator":  indicator,
+        "alert_type": alert_type,
+        "severity":   severity,
+    }
+
+
+def _classify_wazuh_alert(description: str) -> str:
+    """Maps Wazuh rule description to AEGIS alert type."""
+    d = description.lower()
+    if any(k in d for k in ["brute", "authentication failure",
+                             "failed login", "invalid user"]):
+        return "brute_force"
+    if any(k in d for k in ["scan", "nmap", "port scan"]):
+        return "port_scan"
+    if any(k in d for k in ["sql", "injection"]):
+        return "sql_injection"
+    if any(k in d for k in ["phish", "malicious email"]):
+        return "phishing"
+    if any(k in d for k in ["exfil", "large transfer",
+                             "data transfer"]):
+        return "data_exfil"
+    if any(k in d for k in ["lateral", "rdp", "internal ssh"]):
+        return "lateral_movement"
+    if any(k in d for k in ["malware", "trojan", "virus"]):
+        return "malware"
+    return "wazuh_alert"
+
+
+def _process_wazuh_incident(indicator, alert_type, title,
+                             severity, mitre_id,
+                             description, rule_id):
+    """Background task — enriches and saves Wazuh incident."""
+    db = SessionLocal()
     try:
-        # Only do CVE lookup for exploitation alerts
-        # to avoid too many NVD API calls
-        exploitation_types = [
-            "sql_injection", "web_exploit", "ssh_brute_force",
-            "brute_force", "port_scan", "ftp_brute_force"
-        ]
-        cve_result = {}
-        if any(t in alert_type.lower()
-               for t in exploitation_types):
-            cve_result = enrich_alert_with_cves(alert_type)
-            if cve_result.get("cves_found", 0) > 0:
-                print(f"  {GREEN}[✓] CVE lookup: "
-                      f"{cve_result['cves_found']} CVEs found, "
-                      f"top: {cve_result.get('top_cve_id','?')} "
-                      f"CVSS {cve_result.get('top_cvss','?')}"
-                      f"{RESET}")
-        result["cve"] = cve_result
-    except Exception as e:
-        print(f"  {YELLOW}[!] CVE lookup failed: {e}{RESET}")
-        cve_result = {}
+        # IOC enrichment
+        ioc_result   = check_ioc(indicator)
+        score_result = score_from_ioc_result(ioc_result)
+        score_result.score = ioc_result.get("score", score_result.score)
+        score_result.verdict = ioc_result.get("verdict", score_result.verdict)
+        mitre_tag    = tag_alert(alert_type, mitre_id,
+                                 description)
+        cve_result   = {}
 
-    # ── Step 5: Save to Database ──────────────────────────────────────────────
-
-    own_session = False
-    if db is None:
-        db = SessionLocal()
-        own_session = True
-
-    try:
-        alert_data = {
+        inc_data = {
+            "title":                title,
             "alert_type":           alert_type,
-            "source":               source,
+            "source":               "wazuh",
+            "severity":             severity,
             "indicator":            indicator,
-            "indicator_type":       (ioc_result.get("type")
-                                     or indicator_type
-                                     or "unknown"),
+            "indicator_type":       ioc_result.get("type", "ip"),
             "risk_score":           score_result.score,
             "verdict":              score_result.verdict,
             "mitre_technique_id":   mitre_tag.technique_id,
@@ -352,502 +663,285 @@ def process_alert_pipeline(
                 "vt_result", {}).get("total", 0),
             "abuse_score":   (ioc_result.get(
                 "abuse_result") or {}).get("abuse_score", 0),
-            "domain_age_days": (ioc_result.get(
-                "whois_result") or {}).get("age_days"),
-            "cve_id":    cve_result.get("top_cve_id"),
-            "cvss_score": cve_result.get("top_cvss"),
-            "status":    "open",
-            "raw_data":  json.dumps({
+            "wazuh_rule_id": rule_id,
+            "status":        "new",
+            "raw_data":      json.dumps({
                 "ioc":   ioc_result,
-                "score": ioc_result.get("score", 0),
-                "verdict": ioc_result.get("verdict", "UNKNOWN"),
-                "cve":   cve_result,
+                "score": score_result.to_dict(),
             }),
         }
 
-        saved_alert        = save_alert(db, alert_data)
-        result["alert_id"] = saved_alert.id
-        print(f"  {GREEN}[✓] Alert saved — "
-              f"ID: {saved_alert.id}{RESET}")
+        inc = save_incident(db, inc_data)
+
+        # Auto-add creation note
+        add_investigation_note(
+            db, inc.id, None, "AEGIS",
+            "note_added",
+            f"Incident auto-created from Wazuh rule "
+            f"{rule_id or 'unknown'}. "
+            f"Risk score: {score_result.score}/100. "
+            f"MITRE: {mitre_tag.technique_id}"
+        )
+
+        print(f"  {GREEN}[✓] Wazuh incident created — "
+              f"ID: {inc.id} Score: {score_result.score}{RESET}")
 
     except Exception as e:
-        import traceback
-        print(f"  {YELLOW}[!] Database save failed: {e}{RESET}")
-        print(traceback.format_exc())
-        result["alert_id"] = None
+        print(f"  {YELLOW}[!] Wazuh incident failed: {e}{RESET}")
     finally:
-        if own_session:
-            db.close()
-
-    return result
+        db.close()
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# API ENDPOINTS
-# ══════════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════
+# ANALYST TOOLKIT ENDPOINTS
+# ══════════════════════════════════════════════════════════════════
 
-# ── Health check ──────────────────────────────────────────────────────────────
-@app.get("/health")
-async def health_check():
-    """
-    NEW CONCEPT — @app.get("/health"):
-      The decorator registers this function as a GET endpoint.
-      When browser or curl sends GET to /health,
-      FastAPI calls this function and returns its result as JSON.
-
-    Returns simple status — used to verify AEGIS is running.
-    """
-    return {
-        "status":    "running",
-        "tool":      TOOL_NAME,
-        "version":   VERSION,
-        "author":    AUTHOR,
-        "timestamp": datetime.utcnow().isoformat(),
-    }
-
-
-# ── Manual IOC check endpoint ─────────────────────────────────────────────────
-@app.post("/alert/manual",
-          status_code=status.HTTP_201_CREATED)
-async def create_manual_alert(
-    alert_in: AlertCreate,
-    db:       Session = Depends(get_db)
+@app.post("/toolkit/ioc")
+async def toolkit_ioc(
+    req: IOCRequest,
+    analyst: Analyst = Depends(get_current_analyst),
+    db: Session = Depends(get_db)
 ):
     """
-    Analyst manually submits an IOC to investigate.
-
-    NEW CONCEPT — status_code=201:
-      HTTP 201 = Created. Correct code when a new
-      resource is created. 200 = OK for reads.
-      FastAPI returns 200 by default — we override here.
-
-    NEW CONCEPT — Depends(get_db):
-      Dependency injection. FastAPI automatically calls
-      get_db() and passes the result as 'db'.
-      When the function returns, FastAPI calls get_db()'s
-      finally block to close the session.
-      You never manage the session manually.
-
-    NEW CONCEPT — async def:
-      Async functions can be paused while waiting
-      (e.g. waiting for API response) and other
-      requests can be handled in the meantime.
-      Makes the server more efficient under load.
+    Manual IOC investigation tool.
+    Results saved to ioc_scans table — NOT incidents.
+    Can be linked to an incident if analyst chooses.
     """
-    try:
-        result = process_alert_pipeline(
-            indicator      = alert_in.indicator,
-            alert_type     = alert_in.alert_type,
-            indicator_type = alert_in.indicator_type,
-            source         = alert_in.source or "manual",
-            description    = alert_in.description or "",
-            mitre_id       = alert_in.mitre_id,
-            db             = db
-        )
-        return {
-            "message":  "Alert processed successfully",
-            "alert_id": result.get("alert_id"),
-            "score":    result.get("score", {}).get("score", 0),
-            "verdict":  result.get("score", {}).get(
-                "verdict", "UNKNOWN"),
-            "mitre_id": result.get("mitre", {}).get(
-                "technique_id", "Unknown"),
-            "details":  result,
-        }
+    print(f"\n{BLUE}[*] IOC check by {analyst.display_name}: "
+          f"{req.indicator}{RESET}")
 
-    except Exception as e:
-        """
-        NEW CONCEPT — HTTPException:
-          Raises an HTTP error with a status code and message.
-          FastAPI converts this to a proper JSON error response.
-          status_code=500 = Internal Server Error
-          detail = the error message the client receives
-        """
-        raise HTTPException(
-            status_code = status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail      = f"Alert processing failed: {str(e)}"
-        )
-
-
-# ── Wazuh webhook — receives alerts from Shuffle ──────────────────────────────
-@app.post("/wazuh-alert",
-          status_code=status.HTTP_200_OK)
-async def receive_wazuh_alert(
-    wazuh_alert:      WazuhAlert,
-    background_tasks: BackgroundTasks,
-    db:               Session = Depends(get_db)
-):
-    """
-    Webhook endpoint that receives Wazuh alerts via Shuffle.
-
-    How this works in the pipeline:
-      Wazuh detects something on Windows 10 agent
-      → Wazuh sends alert to Shuffle
-      → Shuffle workflow sends POST to this endpoint
-      → AEGIS processes the alert
-      → AEGIS saves to database
-      → Dashboard shows it in 5 seconds
-
-    NEW CONCEPT — BackgroundTasks:
-      Some operations are slow (CVE lookup, Gemini AI).
-      We don't want Shuffle to wait 30 seconds for a response.
-      BackgroundTasks lets us:
-        1. Return HTTP 200 immediately to Shuffle
-        2. Continue heavy processing in the background
-      Shuffle is happy, processing happens, everyone wins.
-    """
-
-    # Extract the most useful indicator from Wazuh alert
-    # Priority: src_ip → agent_ip → rule description
-    indicator = (wazuh_alert.src_ip
-                 or wazuh_alert.agent_ip
-                 or "unknown")
-
-    # Determine alert type from Wazuh rule description
-    alert_type = "wazuh_alert"
-    if wazuh_alert.rule_description:
-        desc_lower = wazuh_alert.rule_description.lower()
-        if "brute" in desc_lower or "authentication failure" in desc_lower:
-            alert_type = "brute_force"
-        elif "scan" in desc_lower or "nmap" in desc_lower:
-            alert_type = "port_scan"
-        elif "sql" in desc_lower or "injection" in desc_lower:
-            alert_type = "sql_injection"
-        elif "phish" in desc_lower or "malicious email" in desc_lower:
-            alert_type = "phishing"
-        elif "exfil" in desc_lower or "large transfer" in desc_lower:
-            alert_type = "data_exfil"
-        elif "lateral" in desc_lower or "rdp" in desc_lower:
-            alert_type = "lateral_movement"
-
-    # Return immediately to Shuffle, process in background
-    background_tasks.add_task(
-        process_alert_pipeline,
-        indicator   = indicator,
-        alert_type  = alert_type,
-        source      = "wazuh",
-        description = wazuh_alert.rule_description or "",
-        mitre_id    = wazuh_alert.mitre_id,
-        db          = db
+    ioc_result   = check_ioc(req.indicator)
+    score_result = score_from_ioc_result(ioc_result)
+    score_result.score = ioc_result.get("score", score_result.score)
+    score_result.verdict = ioc_result.get("verdict", score_result.verdict)
+    mitre_tag    = tag_alert(
+        _type_to_alert(ioc_result.get("type", "ip")),
+        None, ""
     )
 
-    return {
-        "status":     "received",
-        "message":    "Wazuh alert queued for processing",
-        "indicator":  indicator,
-        "rule_id":    wazuh_alert.rule_id,
-        "alert_type": alert_type,
-    }
+    # Save to ioc_scans table
+    vt    = ioc_result.get("vt_result", {})
+    abuse = ioc_result.get("abuse_result") or {}
+    whois = ioc_result.get("whois_result") or {}
 
-
-# ── Get all alerts ────────────────────────────────────────────────────────────
-@app.get("/alerts")
-async def get_alerts(
-    limit:  int     = 100,
-    offset: int     = 0,
-    db:     Session = Depends(get_db)
-):
-    """
-    Returns all alerts sorted by risk score (highest first).
-    Used by the dashboard alert queue.
-
-    Query parameters:
-      limit=100  — return up to 100 alerts
-      offset=0   — start from alert 0 (pagination)
-
-    Example: GET /alerts?limit=50&offset=50
-      Returns alerts 51-100
-    """
-    alerts = get_all_alerts(db, limit=limit, offset=offset)
-    return {
-        "alerts": [a.to_dict() for a in alerts],
-        "count":  len(alerts),
-        "total":  db.query(Alert).count(),
-    }
-
-
-# ── Get single alert with full details ───────────────────────────────────────
-@app.get("/alert/{alert_id}")
-async def get_alert(
-    alert_id: int,
-    db:       Session = Depends(get_db)
-):
-    """
-    Returns one alert with all enrichment data.
-    Called when analyst clicks an alert in the dashboard.
-
-    NEW CONCEPT — path parameter {alert_id}:
-      The {alert_id} in the URL path becomes a function parameter.
-      GET /alert/42 → alert_id = 42
-      FastAPI automatically converts it to int.
-    """
-    alert = get_alert_by_id(db, alert_id)
-
-    if not alert:
-        raise HTTPException(
-            status_code = status.HTTP_404_NOT_FOUND,
-            detail      = f"Alert {alert_id} not found"
-        )
-
-    alert_dict = alert.to_dict()
-
-    # Parse raw_data JSON if it exists
-    if alert.raw_data:
-        try:
-            alert_dict["enrichment"] = json.loads(alert.raw_data)
-        except json.JSONDecodeError:
-            alert_dict["enrichment"] = {}
-
-    # Get analyst notes for this alert
-    notes = (db.query(AnalystNote)
-               .filter(AnalystNote.alert_id == alert_id)
-               .all())
-    alert_dict["notes"] = [
-        {
-            "id":         n.id,
-            "note":       n.note,
-            "action":     n.action,
-            "created_at": n.created_at.isoformat()
-                          if n.created_at else None,
-        }
-        for n in notes
-    ]
-
-    return alert_dict
-
-
-# ── Update alert status ───────────────────────────────────────────────────────
-@app.put("/alert/{alert_id}/status")
-async def update_status(
-    alert_id:  int,
-    status_in: AlertStatusUpdate,
-    db:        Session = Depends(get_db)
-):
-    """
-    Updates the status of an alert.
-    Called when analyst escalates, closes, or begins
-    investigating an alert.
-
-    Valid statuses:
-      open          — default, not looked at yet
-      investigating — analyst is working on it
-      escalated     — sent to L2
-      closed_tp     — closed as true positive
-      closed_fp     — closed as false positive
-    """
-    alert = get_alert_by_id(db, alert_id)
-    if not alert:
-        raise HTTPException(status_code=404,
-                           detail=f"Alert {alert_id} not found")
-
-    valid_statuses = [
-        "open", "investigating", "escalated",
-        "closed_tp", "closed_fp"
-    ]
-    if status_in.status not in valid_statuses:
-        raise HTTPException(
-            status_code = 422,
-            detail      = f"Invalid status. Must be one of: "
-                          f"{valid_statuses}"
-        )
-
-    alert.status = status_in.status
-    if status_in.status == "escalated":
-        alert.escalated = True
-
-    db.commit()
-    db.refresh(alert)
-
-    return {
-        "message":  "Status updated",
-        "alert_id": alert_id,
-        "status":   alert.status,
-    }
-
-
-# ── Add analyst note ──────────────────────────────────────────────────────────
-@app.post("/alert/{alert_id}/notes",
-          status_code=201)
-async def add_note(
-    alert_id: int,
-    note_in:  NoteCreate,
-    db:       Session = Depends(get_db)
-):
-    """
-    Adds an investigation note to an alert.
-    Called when analyst types findings in the
-    notes field of the dashboard.
-    """
-    alert = get_alert_by_id(db, alert_id)
-    if not alert:
-        raise HTTPException(status_code=404,
-                           detail=f"Alert {alert_id} not found")
-
-    note = AnalystNote(
-        alert_id = alert_id,
-        note     = note_in.note,
-        action   = note_in.action,
+    scan = IOCScan(
+        analyst_id     = analyst.id,
+        incident_id    = req.incident_id,
+        indicator      = req.indicator,
+        indicator_type = ioc_result.get("type", "ip"),
+        vt_malicious   = vt.get("malicious", 0),
+        vt_suspicious  = vt.get("suspicious", 0),
+        vt_total       = vt.get("total", 0),
+        abuse_score    = abuse.get("abuse_score", 0),
+        country        = abuse.get("country"),
+        isp            = abuse.get("isp"),
+        total_reports  = abuse.get("total_reports", 0),
+        domain_age_days = whois.get("age_days"),
+        registrar      = whois.get("registrar"),
+        risk_score     = score_result.score,
+        verdict        = score_result.verdict,
     )
-    db.add(note)
+    db.add(scan)
 
-    # Also update the alert's notes field for quick access
-    existing = alert.analyst_notes or ""
-    timestamp = datetime.utcnow().strftime("%H:%M")
-    alert.analyst_notes = (f"{existing}\n[{timestamp}] "
-                           f"{note_in.note}").strip()
+    # If linked to incident — add to timeline
+    if req.incident_id:
+        add_investigation_note(
+            db, req.incident_id, analyst.id,
+            analyst.display_name,
+            "note_added",
+            f"IOC check by {analyst.display_name}: "
+            f"{req.indicator} — "
+            f"{score_result.verdict} ({score_result.score}/100). "
+            f"VT: {vt.get('malicious',0)}/{vt.get('total',0)} "
+            f"AbuseIPDB: {abuse.get('abuse_score',0)}/100"
+        )
 
     db.commit()
 
     return {
-        "message":  "Note added",
-        "alert_id": alert_id,
-        "note":     note_in.note,
+        "scan_id":      scan.id,
+        "indicator":    req.indicator,
+        "type":         ioc_result.get("type"),
+        "score":        score_result.score,
+        "verdict":      score_result.verdict,
+        "risk_level":   score_result.risk_level,
+        "colour":       score_result.colour,
+        "flags":        score_result.flags,
+        "virustotal": {
+            "malicious":  vt.get("malicious", 0),
+            "suspicious": vt.get("suspicious", 0),
+            "total":      vt.get("total", 0),
+        },
+        "abuseipdb": {
+            "score":         abuse.get("abuse_score", 0),
+            "country":       abuse.get("country"),
+            "isp":           abuse.get("isp"),
+            "total_reports": abuse.get("total_reports", 0),
+            "last_reported": abuse.get("last_reported"),
+        },
+        "whois": {
+            "age_days":     whois.get("age_days"),
+            "creation_date": whois.get("creation_date"),
+            "age_risk":     whois.get("age_risk"),
+            "registrar":    whois.get("registrar"),
+        },
+        "mitre": {
+            "technique_id":   mitre_tag.technique_id,
+            "technique_name": mitre_tag.technique_name,
+            "tactic":         mitre_tag.tactic,
+            "kill_chain":     mitre_tag.kill_chain,
+            "severity":       mitre_tag.severity,
+        },
+        "linked_incident": req.incident_id,
+        "analyst":         analyst.display_name,
     }
 
 
-# ── Analyst feedback (thumbs up/down) ────────────────────────────────────────
-@app.post("/alert/{alert_id}/feedback")
-async def add_feedback(
-    alert_id:    int,
-    feedback_in: FeedbackCreate,
-    db:          Session = Depends(get_db)
+def _type_to_alert(indicator_type: str) -> str:
+    mapping = {
+        "ip":     "ip_reputation",
+        "domain": "domain_check",
+        "url":    "url_check",
+        "hash":   "hash_check",
+    }
+    return mapping.get(indicator_type, "unknown")
+
+
+@app.post("/toolkit/email")
+async def toolkit_email(
+    req: EmailRequest,
+    analyst: Analyst = Depends(get_current_analyst),
+    db: Session = Depends(get_db)
 ):
     """
-    Records analyst judgment: true positive or false positive.
-    This feedback is used by F20 (FP pattern learner)
-    to suggest suppression rules over time.
+    Email phishing analysis tool.
+    Results saved to email_scans — NOT incidents.
     """
-    alert = get_alert_by_id(db, alert_id)
-    if not alert:
-        raise HTTPException(status_code=404,
-                           detail=f"Alert {alert_id} not found")
+    from email_analyser import analyse_email
 
-    alert.is_true_positive = feedback_in.is_true_positive
+    print(f"\n{BLUE}[*] Email analysis by "
+          f"{analyst.display_name}{RESET}")
 
-    if feedback_in.is_true_positive:
-        alert.status = "closed_tp"
-    else:
-        alert.status = "closed_fp"
+    result = analyse_email(req.raw_headers)
 
-    if feedback_in.notes:
-        existing = alert.analyst_notes or ""
-        timestamp = datetime.utcnow().strftime("%H:%M")
-        feedback_label = ("TRUE POSITIVE"
-                          if feedback_in.is_true_positive
-                          else "FALSE POSITIVE")
-        alert.analyst_notes = (
-            f"{existing}\n[{timestamp}] "
-            f"[{feedback_label}] {feedback_in.notes}"
-        ).strip()
-
+    from database import EmailScan
+    scan = EmailScan(
+        analyst_id    = analyst.id,
+        incident_id   = req.incident_id,
+        from_address  = result.get("headers",{}).get("from"),
+        reply_to      = result.get("headers",{}).get("reply_to"),
+        subject       = result.get("headers",{}).get("subject"),
+        sender_ip     = result.get("sender_ip"),
+        reply_mismatch = result.get(
+            "reply_mismatch",{}).get("mismatch", False),
+        urls_found    = len(result.get("urls", [])),
+        malicious_urls = len([
+            u for u in result.get("url_results",[])
+            if u.get("status") == "MALICIOUS"
+        ]),
+        domain_age_days = (result.get("whois_result") or {})
+                          .get("age_days"),
+        risk_score    = result.get("score", 0),
+        verdict       = result.get("verdict", "UNKNOWN"),
+    )
+    db.add(scan)
     db.commit()
 
     return {
-        "message":          "Feedback recorded",
-        "alert_id":         alert_id,
-        "is_true_positive": feedback_in.is_true_positive,
-        "new_status":       alert.status,
+        "scan_id":       scan.id,
+        "verdict":       result.get("verdict"),
+        "score":         result.get("score"),
+        "from":          result.get("headers",{}).get("from"),
+        "subject":       result.get("headers",{}).get("subject"),
+        "sender_ip":     result.get("sender_ip"),
+        "reply_mismatch": result.get(
+            "reply_mismatch",{}).get("mismatch", False),
+        "spf":    (result.get("auth_result",{})
+                   .get("spf",{}).get("status")),
+        "dmarc":  (result.get("auth_result",{})
+                   .get("dmarc",{}).get("status")),
+        "urls_found":    len(result.get("urls", [])),
+        "malicious_urls": scan.malicious_urls,
+        "url_results":   result.get("url_results", []),
+        "domain_age":    result.get(
+            "whois_result",{}).get("age_days"),
+        "analyst":       analyst.display_name,
     }
 
 
-# ── Dashboard statistics ──────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════
+# STATS + INTELLIGENCE
+# ══════════════════════════════════════════════════════════════════
+
 @app.get("/stats")
-async def get_dashboard_stats(db: Session = Depends(get_db)):
-    """
-    Returns metrics for the dashboard top bar.
-    Called every 10 seconds by the dashboard.
-    """
-    stats = get_stats(db)
-
-    # Add MITRE heatmap data
-    mitre_counts = {}
-    alerts = db.query(Alert).filter(
-        Alert.mitre_technique_id.isnot(None)
-    ).all()
-
-    for alert in alerts:
-        tid = alert.mitre_technique_id
-        if tid and tid != "Unknown":
-            mitre_counts[tid] = mitre_counts.get(tid, 0) + 1
-
-    stats["mitre_heatmap"] = mitre_counts
-
-    return stats
+async def get_dashboard_stats(
+    analyst: Analyst = Depends(get_current_analyst),
+    db: Session = Depends(get_db)
+):
+    """Dashboard metrics."""
+    return get_stats(db)
 
 
-# ── MITRE heatmap data ────────────────────────────────────────────────────────
 @app.get("/mitre/heatmap")
-async def get_mitre_heatmap(db: Session = Depends(get_db)):
-    """
-    Returns ATT&CK technique counts for dashboard heatmap.
-    """
-    alerts = db.query(Alert).filter(
-        Alert.mitre_technique_id.isnot(None)
-    ).all()
+async def mitre_heatmap(
+    analyst: Analyst = Depends(get_current_analyst),
+    db: Session = Depends(get_db)
+):
+    """ATT&CK technique counts."""
+    incidents = db.query(Incident).filter(
+        Incident.mitre_technique_id.isnot(None)).all()
 
     heatmap = {}
-    for alert in alerts:
-        tid = alert.mitre_technique_id
+    for inc in incidents:
+        tid = inc.mitre_technique_id
         if tid and tid not in ["Unknown", "T0000"]:
             if tid not in heatmap:
                 heatmap[tid] = {
-                    "count":   0,
-                    "name":    alert.mitre_technique_name,
-                    "tactic":  alert.mitre_tactic,
+                    "count":  0,
+                    "name":   inc.mitre_technique_name,
+                    "tactic": inc.mitre_tactic,
                 }
             heatmap[tid]["count"] += 1
 
+    return {"heatmap": heatmap,
+            "techniques": len(heatmap)}
+
+
+@app.get("/analysts/active")
+async def active_analysts(
+    analyst: Analyst = Depends(get_current_analyst),
+    db: Session = Depends(get_db)
+):
+    """Returns all active analysts."""
+    analysts = db.query(Analyst).filter(
+        Analyst.is_active == True).all()
+    return {"analysts": [a.to_dict() for a in analysts]}
+
+
+@app.get("/health")
+async def health():
     return {
-        "heatmap":    heatmap,
-        "techniques": len(heatmap),
-        "total":      sum(v["count"] for v in heatmap.values()),
+        "status":  "running",
+        "tool":    TOOL_NAME,
+        "version": VERSION,
+        "author":  AUTHOR,
+        "time":    datetime.utcnow().isoformat(),
     }
 
 
-# ── Serve dashboard static files ──────────────────────────────────────────────
-"""
-NEW CONCEPT — StaticFiles:
-  Serves HTML, CSS, JS files directly from FastAPI.
-  Your dashboard/index.html is served at /dashboard
-  No separate web server needed.
-"""
+# ── Serve dashboard ───────────────────────────────────────────────
 dashboard_dir = os.path.join(
     os.path.dirname(os.path.abspath(__file__)),
     "..", "dashboard"
 )
-
 if os.path.exists(dashboard_dir):
-    app.mount(
-        "/dashboard",
-        StaticFiles(directory=dashboard_dir, html=True),
-        name="dashboard"
-    )
+    app.mount("/dashboard",
+              StaticFiles(directory=dashboard_dir, html=True),
+              name="dashboard")
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# RUN SERVER
-# ══════════════════════════════════════════════════════════════════════════════
-
+# ── Run ───────────────────────────────────────────────────────────
 if __name__ == "__main__":
     import uvicorn
-
-    print(f"\n{BOLD}Starting AEGIS server...{RESET}")
-    print(f"  Dashboard : http://localhost:8000/dashboard")
-    print(f"  API docs  : http://localhost:8000/docs")
-    print(f"  Health    : http://localhost:8000/health\n")
-
-    """
-    NEW CONCEPT — uvicorn.run():
-      Uvicorn is the ASGI server that runs FastAPI.
-      host="0.0.0.0" means accept connections from
-      any network interface (not just localhost).
-      port=8000 is the port number.
-      reload=True restarts server when code changes —
-      very useful during development.
-    """
-    uvicorn.run(
-        "main:app",
-        host    = "0.0.0.0",
-        port    = 8000,
-        reload  = True
-    )
+    uvicorn.run("main:app", host="0.0.0.0",
+                port=8000, reload=True)
